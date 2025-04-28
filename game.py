@@ -4,6 +4,9 @@ import random
 import requests
 import threading
 import math
+import time
+from pymongo import MongoClient
+from urllib.parse import quote_plus
 
 pygame.init()
 
@@ -89,13 +92,173 @@ pipe_group = pygame.sprite.Group()
 # submit score, dev2
 score_submitted = False
 
-def submit_score(score, name="Unknown"):
-    url = "http://localhost:8000/score"
-    data = {"name": name, "score": score}
+# Configuration de la connexion MongoDB Atlas
+def get_mongodb_connection():
+    username = quote_plus("mboutalmaouine0907")
+    password = quote_plus("4cqch8MiGgq3YZll")
+    uri = f"mongodb+srv://{username}:{password}@cluster0.qrixdve.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    
+    # Options de connexion pour résoudre les problèmes SSL
+    connection_options = {
+        "serverSelectionTimeoutMS": 5000,  # Timeout réduit à 5 secondes
+        "connectTimeoutMS": 5000,
+        "retryWrites": True,
+        "retryReads": True,
+        "tlsAllowInvalidCertificates": True  # Utiliser cette option au lieu de ssl_cert_reqs
+    }
+    
     try:
-        requests.post(url, json=data)
-    except:
-        pass
+        return MongoClient(uri, **connection_options)
+    except Exception as e:
+        print(f"Erreur de connexion MongoDB: {e}")
+        print("Fonctionnement en mode hors ligne")
+        return None
+
+# Variables globales pour le cache des scores
+cached_scores = []
+last_scores_update = 0
+score_cache_duration = 60  # Durée du cache en secondes (augmentée à 60 secondes)
+
+# Scores par défaut à afficher en cas de problème de connexion
+default_scores = [
+    {"rank": 1, "name": "Player1", "score": 100},
+    {"rank": 2, "name": "Player2", "score": 75},
+    {"rank": 3, "name": "Player3", "score": 50}
+]
+
+# Fonction pour récupérer les scores depuis MongoDB de manière asynchrone
+def fetch_scores_async():
+    global cached_scores, last_scores_update
+    
+    try:
+        client = get_mongodb_connection()
+        if client is None:
+            print("Mode hors ligne: utilisation des scores en cache")
+            return
+            
+        db = client["flappy_beard"]
+        scores_collection = db["scores"]
+        
+        # Récupérer les 3 meilleurs scores
+        top_scores = list(scores_collection.find().sort("score", -1).limit(3))
+        
+        # Formater les résultats
+        formatted_scores = []
+        for i, score_doc in enumerate(top_scores):
+            formatted_scores.append({
+                "rank": i + 1,
+                "name": score_doc.get("name", "Unknown"),
+                "score": score_doc.get("score", 0)
+            })
+        
+        client.close()
+        
+        # Mettre à jour le cache
+        cached_scores = formatted_scores
+        last_scores_update = time.time()
+        
+        print("Scores mis à jour depuis MongoDB")
+    except Exception as e:
+        print(f"Erreur lors de la récupération des scores: {e}")
+        print("Utilisation des scores en cache")
+
+# Fonction pour récupérer les trois meilleurs scores avec mise en cache
+def get_top_three_scores():
+    global cached_scores, last_scores_update
+    
+    current_time = time.time()
+    
+    # Si le cache est vide ou expiré, lancer une mise à jour asynchrone
+    if not cached_scores or (current_time - last_scores_update > score_cache_duration):
+        # Si le cache est complètement vide, utiliser les scores par défaut et lancer une mise à jour en arrière-plan
+        if not cached_scores:
+            print("Cache vide, utilisation des scores par défaut et mise à jour en arrière-plan...")
+            cached_scores = default_scores.copy()
+            # Lancer une mise à jour en arrière-plan
+            update_thread = threading.Thread(target=fetch_scores_async)
+            update_thread.daemon = True
+            update_thread.start()
+        else:
+            # Sinon, lancer une mise à jour en arrière-plan
+            print("Mise à jour asynchrone des scores...")
+            update_thread = threading.Thread(target=fetch_scores_async)
+            update_thread.daemon = True
+            update_thread.start()
+    
+    return cached_scores
+
+def submit_score(score, name="Unknown"):
+    # Déclarer les variables globales en début de fonction
+    global cached_scores, last_scores_update
+    
+    # Enregistrer le score de manière synchrone pour garantir qu'il est enregistré
+    # même si l'utilisateur quitte rapidement
+    try:
+        # Connexion à MongoDB Atlas
+        client = get_mongodb_connection()
+        if client is None:
+            print(f"Mode hors ligne: impossible d'enregistrer le score {score} pour {name}")
+            print("Le score sera conservé localement jusqu'à la prochaine connexion réussie")
+            
+            # Ajouter le score au cache local si meilleur que les scores existants
+            for cached_score in cached_scores:
+                if cached_score["name"] == name and score > cached_score["score"]:
+                    cached_score["score"] = score
+                    print(f"Score local mis à jour pour {name}: {score}")
+                    break
+            else:
+                # Si le joueur n'est pas dans le cache, l'ajouter si son score est bon
+                if len(cached_scores) < 3 or score > min([s["score"] for s in cached_scores], default=0):
+                    cached_scores.append({"rank": len(cached_scores)+1, "name": name, "score": score})
+                    print(f"Nouveau score local enregistré pour {name}: {score}")
+            return
+            
+        db = client["flappy_beard"]
+        scores_collection = db["scores"]
+        
+        # Vérifier si l'utilisateur existe déjà
+        existing_user = scores_collection.find_one({"name": name})
+        
+        if existing_user:
+            # Si le nouveau score est meilleur, mettre à jour
+            if score > existing_user.get("score", 0):
+                scores_collection.update_one(
+                    {"name": name},
+                    {"$set": {"score": score}}
+                )
+                print(f"Score mis à jour pour {name}: {score}")
+        else:
+            # Nouvel utilisateur, insérer le score
+            scores_collection.insert_one({
+                "name": name,
+                "score": score
+            })
+            print(f"Nouveau score enregistré pour {name}: {score}")
+        
+        # Fermer la connexion
+        client.close()
+        
+        # Forcer une mise à jour du cache après la soumission d'un nouveau score
+        # Mettre à jour directement le cache avec le nouveau score
+        if score > 0:  # Seulement si le score est valide
+            # Lancer une mise à jour asynchrone du cache pour les prochains accès
+            update_thread = threading.Thread(target=fetch_scores_async)
+            update_thread.daemon = True
+            update_thread.start()
+    except Exception as e:
+        print(f"Erreur lors de la soumission du score: {e}")
+        # Fallback à l'API si la connexion directe échoue
+        try:
+            url = "http://localhost:8000/score"
+            data = {"name": name, "score": score}
+            requests.post(url, json=data)
+        except:
+            pass
+
+# Cette fonction n'est plus utilisée car nous avons rendu submit_score synchrone
+# pour garantir l'enregistrement des scores même si l'utilisateur quitte rapidement
+def _submit_score_thread(score, name):
+    pass
 
 class FloatingBird(pygame.sprite.Sprite):
     def __init__(self, x, y):
@@ -133,12 +296,25 @@ def reset_game():
     return 0  # Return 0 for score
 
 # Get Player Name Function
+# Initialiser les scores au démarrage du jeu
+def initialize_scores():
+    global cached_scores
+    # Démarrer avec les scores par défaut
+    cached_scores = default_scores.copy()
+    # Lancer le chargement des vrais scores en arrière-plan
+    preload_thread = threading.Thread(target=fetch_scores_async)
+    preload_thread.daemon = True
+    preload_thread.start()
+
+# Initialiser les scores au démarrage
+initialize_scores()
+
 def get_player_name():
     input_box = pygame.Rect(screen_width // 2 - 100, screen_height // 2 - 30, 200, 40)
     color_inactive = pygame.Color('lightskyblue3')
     color_active = pygame.Color('dodgerblue2')
     color = color_inactive
-    active = False
+    active = True  # Actif par défaut pour éviter un clic supplémentaire
     text = ''
     input_font = pygame.font.SysFont('Bauhaus 93', 30)  # Smaller font for input
     done = False
@@ -150,7 +326,7 @@ def get_player_name():
                 exit()
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if input_box.collidepoint(event.pos):
-                    active = not active
+                    active = True
                 else:
                     active = False
                 color = color_active if active else color_inactive
@@ -199,13 +375,8 @@ def get_player_name():
     return text if text != '' else "Unknown"
 
 def get_top_scores():
-    try:
-        response = requests.get("http://localhost:8000/leaderboard", timeout=1)  # Ajout d'un timeout
-        if response.status_code == 200:
-            return response.json()[:3]
-    except:
-        return []  # Retourne une liste vide en cas d'erreur
-    return []
+    # Utiliser directement la fonction qui récupère les scores depuis MongoDB
+    return get_top_three_scores()
 
 def main_menu():
     # Position des boutons ajustée et séparée
@@ -234,10 +405,10 @@ def main_menu():
     # Local ground scroll for menu animation
     local_ground_scroll = 0
 
-    # Cache des scores pour éviter les requêtes trop fréquentes
+    # Utiliser directement les scores en cache, sans attente
     top_scores = get_top_scores()
     last_score_update = pygame.time.get_ticks()
-    score_update_delay = 5000  # Mise à jour des scores toutes les 5 secondes
+    score_update_delay = 60000  # Mise à jour des scores toutes les 60 secondes
     
     # Définir les polices
     title_font = pygame.font.SysFont('Bauhaus 93', 70)
@@ -255,7 +426,7 @@ def main_menu():
     while running:
         current_time = pygame.time.get_ticks()
         
-        # Mise à jour périodique des scores
+        # Mise à jour périodique des scores (moins fréquente pour réduire les requêtes)
         if current_time - last_score_update > score_update_delay:
             top_scores = get_top_scores()
             last_score_update = current_time

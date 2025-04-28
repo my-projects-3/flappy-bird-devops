@@ -1,0 +1,56 @@
+name: Release Game
+
+on:
+  push:
+    tags:
+      - "v*" # Triggers on any tag starting with 'v'
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository code
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Step 2: Set up Python environment
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      # Step 3: Install dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # Step 4: Build the game executable
+      - name: Build Executable
+        run: |
+          pyinstaller --onefile --windowed game.py
+
+      # Step 5: Upload the executable as an artifact
+      - name: Upload Executable Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: game-executable
+          path: dist/*
+
+      # Step 6: Create a release and attach the artifact
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: dist/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: |
+            ### What's New
+            - Automatically packaged the game executable.
+            - Built using PyInstaller.
+          draft: false
+          prerelease: false
